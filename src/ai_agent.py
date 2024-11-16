@@ -1,176 +1,149 @@
-from controller import Robot, Motor, DistanceSensor, PositionSensor
-from dotenv import load_dotenv
 import openai
-import json
-import os
+import sys
+import asyncio
+from controller import Supervisor
 
+# Define the API key directly in the script
+openai.api_key = ""
 
-class AIAgent:
+time_step = 16  # Reduced time step for more frequent updates
+
+class UR5eController:
     def __init__(self):
-        self.controller = RobotController()
+        self.robot = Supervisor()
+        self.time_step = time_step
 
-    def decide_and_act(self, perception):
-        # Create a prompt for GPT-4
-        prompt = self.create_prompt(perception)
-
-        # Get action plan from GPT-4
-        action_plan = self.get_action_plan(prompt)
-
-        # Execute the action plan
-        if action_plan:
-            self.execute_action_plan(action_plan)
-
-    def create_prompt(self, perception):
-        prompt = f"""
-You are an AI agent controlling a UR robot in a factory simulation. Based on the current perception data and state, decide the next actions to perform. Provide the action plan in JSON format.
-
-Perception data:
-- Distance sensor value: {perception['distance']}
-- Wrist position sensor value: {perception['wrist_position']}
-- Current state: {perception['state']}
-
-Constraints:
-- Only use actions: 'GRASP', 'ROTATE', 'RELEASE', 'ROTATE_BACK', 'WAIT'.
-- Ensure the action plan is appropriate based on the perception data.
-
-Output format:
-{{
-  "action": "ACTION_NAME",
-  "parameters": {{
-    // Any parameters needed for the action
-  }}
-}}
-
-Provide only the JSON output.
-"""
-        return prompt
-
-    def get_action_plan(self, prompt):
-        try:
-            response = openai.ChatCompletion.create(
-                model="gpt-4",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=150,
-                temperature=0,
-            )
-            content = response["choices"][0]["message"]["content"]
-            action_plan = json.loads(content)
-            return action_plan
-        except Exception as e:
-            print(f"Error obtaining action plan: {e}")
-            return None
-
-
-class RobotController:
-    def __init__(self, agent: AIAgent):
-        # Initialize the robot
-        self.robot = Robot()
-        self.agent = agent
-        self.time_step = int(self.robot.getBasicTimeStep())
-
-        # Initialize devices
-        self.initialize_devices()
-
-        # Initialize OpenAI API
-        openai.api_key = os.getenv("OPENAI_API_KEY")
-
-        # Agent state
-        self.state = "WAITING"
-
-    def initialize_devices(self):
-        # Initialize hand motors
+        # Initialize Motors
         self.hand_motors = [
             self.robot.getDevice("finger_1_joint_1"),
             self.robot.getDevice("finger_2_joint_1"),
-            self.robot.getDevice("finger_middle_joint_1"),
+            self.robot.getDevice("finger_middle_joint_1")
         ]
-        for motor in self.hand_motors:
-            motor.setPosition(float("inf"))  # Enable velocity control
-            motor.setVelocity(0.0)
 
-        # Initialize UR motors
         self.ur_motors = [
             self.robot.getDevice("shoulder_lift_joint"),
             self.robot.getDevice("elbow_joint"),
             self.robot.getDevice("wrist_1_joint"),
-            self.robot.getDevice("wrist_2_joint"),
+            self.robot.getDevice("wrist_2_joint")
         ]
-        for motor in self.ur_motors:
-            motor.setPosition(float("inf"))  # Enable velocity control
-            motor.setVelocity(0.0)
 
-        # Initialize sensors
+        # Set motor velocities
+        speed = 1.0
+        for motor in self.ur_motors:
+            if motor:
+                motor.setVelocity(speed)
+            else:
+                print("Error: One or more UR motor devices not found.")
+
+        # Enable Sensors
         self.distance_sensor = self.robot.getDevice("distance sensor")
-        self.distance_sensor.enable(self.time_step)
+        if self.distance_sensor:
+            self.distance_sensor.enable(self.time_step)
+        else:
+            print("Error: Distance sensor not found.")
 
         self.position_sensor = self.robot.getDevice("wrist_1_joint_sensor")
-        self.position_sensor.enable(self.time_step)
-
-    def run(self):
-        while self.robot.step(self.time_step) != -1:
-            # Perceive environment
-            perception = self.perceive()
-
-            # Decide and act
-            self.decide_and_act(perception)
-
-    def perceive(self):
-        perception = {
-            "distance": self.distance_sensor.getValue(),
-            "wrist_position": self.position_sensor.getValue(),
-            "state": self.state,
-        }
-        return perception
-
-    def execute_action_plan(self, action_plan):
-        action = action_plan.get("action")
-        parameters = action_plan.get("parameters", {})
-
-        if action == "GRASP":
-            self.grasp()
-        elif action == "ROTATE":
-            self.rotate()
-        elif action == "RELEASE":
-            self.release()
-        elif action == "ROTATE_BACK":
-            self.rotate_back()
-        elif action == "WAIT":
-            self.wait()
+        if self.position_sensor:
+            self.position_sensor.enable(self.time_step)
         else:
-            print(f"Unknown action: {action}")
+            print("Error: Position sensor not found.")
 
     def grasp(self):
-        print("Grasping object...")
+        # Close the gripper
         for motor in self.hand_motors:
-            motor.setPosition(0.85)  # Close gripper
-        self.state = "GRASPING"
-
-    def rotate(self):
-        print("Rotating arm...")
-        target_positions = [-1.88, -2.14, -2.38, -1.51]
-        for motor, position in zip(self.ur_motors, target_positions):
-            motor.setPosition(position)
-        self.state = "ROTATING"
+            if motor:
+                motor.setPosition(0.85)
+            else:
+                print("Error: One or more hand motor devices not found.")
 
     def release(self):
-        print("Releasing object...")
+        # Open the gripper
         for motor in self.hand_motors:
-            motor.setPosition(motor.getMinPosition())  # Open gripper
-        self.state = "RELEASING"
+            if motor:
+                motor.setPosition(motor.getMinPosition())
+            else:
+                print("Error: One or more hand motor devices not found.")
 
-    def rotate_back(self):
-        print("Rotating arm back...")
-        for motor in self.ur_motors:
-            motor.setPosition(0.0)
-        self.state = "ROTATING_BACK"
+    async def ask_gpt4(self, state, sensor_values):
+        prompt = f"The robot is currently in state: '{state}'. The sensor values are: {sensor_values}. What should the next action be? Options: WAIT, GRASP, ROTATE, RELEASE, ROTATE_BACK."
 
-    def wait(self):
-        print("Waiting...")
-        self.state = "WAITING"
+        try:
+            response = await openai.ChatCompletion.acreate(
+                model="gpt-4-0613",
+                messages=[
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=50,
+                temperature=0.7
+            )
+            return response['choices'][0]['message']['content'].strip()
+        except Exception as e:
+            print(f"Error querying OpenAI API: {e}")
+            return "WAIT"
 
+    def run(self):
+        state = "WAITING"
+        counter = 0
+        target_positions = [-1.88, -2.14, -2.38, -1.51]
+
+        async def decision_loop():
+            while True:
+                if self.robot.step(self.time_step) == -1:
+                    break
+
+                sensor_values = {
+                    "distance_sensor": self.distance_sensor.getValue() if self.distance_sensor else None,
+                    "position_sensor": self.position_sensor.getValue() if self.position_sensor else None
+                }
+
+                if state == "WAITING" and self.distance_sensor.getValue() < 500:
+                    # Simple local decision to grasp if close enough
+                    state = "GRASPING"
+                    counter = 8
+                    print("Grasping object")
+                    self.grasp()
+                else:
+                    # Query GPT-4 for the next action
+                    action = await self.ask_gpt4(state, sensor_values)
+
+                    if counter <= 0:
+                        if action == "GRASP":
+                            state = "GRASPING"
+                            counter = 8
+                            print("Grasping object")
+                            self.grasp()
+
+                        elif action == "ROTATE":
+                            for i in range(4):
+                                if self.ur_motors[i]:
+                                    self.ur_motors[i].setPosition(target_positions[i])
+                                else:
+                                    print(f"Error: UR motor {i} not found.")
+                            print("Rotating arm")
+                            state = "ROTATING"
+
+                        elif action == "RELEASE":
+                            counter = 8
+                            print("Releasing object")
+                            state = "RELEASING"
+                            self.release()
+
+                        elif action == "ROTATE_BACK":
+                            for motor in self.ur_motors:
+                                if motor:
+                                    motor.setPosition(0.0)
+                            print("Rotating arm back")
+                            state = "ROTATING_BACK"
+
+                        elif action == "WAIT":
+                            print("Waiting for next object")
+                            state = "WAITING"
+
+                counter -= 1
+
+        # Run the decision loop asynchronously
+        asyncio.run(decision_loop())
 
 if __name__ == "__main__":
-    load_dotenv()
-    agent = AIAgent()
-    controller = RobotController(AIAgent)
+    controller = UR5eController()
     controller.run()
